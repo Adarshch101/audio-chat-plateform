@@ -5,11 +5,21 @@ export class SpeechToTextService {
   private apiKey: string;
   private isConnected: boolean = false;
   private finalTranscriptBuffer: string[] = [];
+  private lastInterimTranscript: string = "";
+  private isSessionActive: boolean = false;
 
   // Turn synchronization states
   private onFinalResultCallback: ((text: string) => void) | null = null;
   private isWaitingForFinal: boolean = false;
   private finalCheckTimeout: NodeJS.Timeout | null = null;
+
+  // Reconnect support: store stream config so we can recreate on drop
+  private lastLanguage: "en" | "hi" = "en";
+  private lastOnPartial: ((text: string) => void) | null = null;
+  private lastOnFinal: ((text: string) => void) | null = null;
+  private lastOnError: ((err: unknown) => void) | null = null;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private keepAliveTimer: NodeJS.Timeout | null = null;
 
   constructor() {
     this.apiKey = process.env.DEEPGRAM_API_KEY || "";
@@ -17,6 +27,10 @@ export class SpeechToTextService {
 
   public isAvailable(): boolean {
     return !!this.apiKey;
+  }
+
+  public getConnectionStatus(): string {
+    return `connected=${this.isConnected}, hasClient=${!!this.client}, sessionActive=${this.isSessionActive}`;
   }
 
   public createStream(
@@ -38,8 +52,34 @@ export class SpeechToTextService {
       return;
     }
 
+    // Store config for reconnection
+    this.lastLanguage = language;
+    this.lastOnPartial = onTranscriptPartial;
+    this.lastOnFinal = onTranscriptFinal;
+    this.lastOnError = onError;
+
     this.finalTranscriptBuffer = [];
     this.isConnected = false;
+    this.isSessionActive = true;
+
+    this.initConnection(language, onTranscriptPartial, onTranscriptFinal, onError);
+  }
+
+  private initConnection(
+    language: "en" | "hi",
+    onTranscriptPartial: (text: string) => void,
+    onTranscriptFinal: (text: string) => void,
+    onError: (err: unknown) => void
+  ) {
+    // Clean up any existing connection
+    if (this.client) {
+      try {
+        this.client.removeAllListeners();
+        this.client.finish();
+      } catch (e) {}
+      this.client = null;
+    }
+    this.stopKeepAlive();
 
     try {
       const deepgram = createClient(this.apiKey);
@@ -58,6 +98,7 @@ export class SpeechToTextService {
       this.client.on(LiveTranscriptionEvents.Open, () => {
         console.log("[STT] Connected to Deepgram.");
         this.isConnected = true;
+        this.startKeepAlive();
       });
 
       this.client.on(LiveTranscriptionEvents.Transcript, (data) => {
@@ -72,6 +113,7 @@ export class SpeechToTextService {
         if (isFinal) {
           console.log(`[STT] Final: "${transcript}"`);
           this.finalTranscriptBuffer.push(transcript);
+          this.lastInterimTranscript = ""; // Clear interim once finalized
           onTranscriptFinal(transcript);
 
           // Resolve turn synchronization promise if waiting
@@ -80,6 +122,7 @@ export class SpeechToTextService {
           }
         } else {
           console.log(`[STT] Interim: "${transcript}"`);
+          this.lastInterimTranscript = transcript;
           onTranscriptPartial(transcript);
         }
       });
@@ -93,12 +136,52 @@ export class SpeechToTextService {
         console.log("[STT] Deepgram connection closed.");
         this.isConnected = false;
         this.client = null;
+        this.stopKeepAlive();
+
+        // Auto-reconnect if the session is still active
+        if (this.isSessionActive) {
+          console.log("[STT] Session still active — scheduling auto-reconnect in 1s...");
+          this.scheduleReconnect();
+        }
       });
 
     } catch (err: unknown) {
       console.error("[STT] Failed to create Deepgram client:", err);
       onError(err);
     }
+  }
+
+  /** Send periodic keepAlive messages to prevent Deepgram idle timeout */
+  private startKeepAlive() {
+    this.stopKeepAlive();
+    this.keepAliveTimer = setInterval(() => {
+      if (this.client && this.isConnected) {
+        try {
+          this.client.keepAlive();
+        } catch (e) {
+          console.warn("[STT] KeepAlive send failed:", e);
+        }
+      }
+    }, 8000); // Send keepAlive every 8 seconds
+  }
+
+  private stopKeepAlive() {
+    if (this.keepAliveTimer) {
+      clearInterval(this.keepAliveTimer);
+      this.keepAliveTimer = null;
+    }
+  }
+
+  /** Schedule a reconnection attempt */
+  private scheduleReconnect() {
+    if (this.reconnectTimer) return; // Already scheduled
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.isSessionActive && !this.isConnected && this.lastOnPartial && this.lastOnFinal && this.lastOnError) {
+        console.log("[STT] Auto-reconnecting to Deepgram...");
+        this.initConnection(this.lastLanguage, this.lastOnPartial, this.lastOnFinal, this.lastOnError);
+      }
+    }, 1000);
   }
 
   public sendAudioChunk(buffer: Buffer) {
@@ -108,15 +191,28 @@ export class SpeechToTextService {
       } catch (err: unknown) {
         console.error("[STT] Failed to send audio chunk to Deepgram:", err);
       }
+    } else if (this.isSessionActive) {
+      // Connection dropped — trigger reconnect if not already scheduled
+      if (!this.reconnectTimer) {
+        console.warn("[STT] Connection not open. Triggering reconnect...");
+        this.scheduleReconnect();
+      }
     } else {
       console.warn("[STT] Cannot forward chunk: Deepgram connection is not open.");
     }
   }
 
   public finishStream() {
+    this.isSessionActive = false;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.stopKeepAlive();
     if (this.client) {
       console.log("[STT] Closing Deepgram stream...");
       try {
+        this.client.removeAllListeners();
         this.client.finish();
       } catch (err: unknown) {
         console.error("[STT] Error closing Deepgram stream:", err);
@@ -125,6 +221,10 @@ export class SpeechToTextService {
     }
     this.isConnected = false;
     this.clearFinalTimeout();
+    // Clear stored callbacks
+    this.lastOnPartial = null;
+    this.lastOnFinal = null;
+    this.lastOnError = null;
   }
 
   /**
@@ -162,7 +262,16 @@ export class SpeechToTextService {
   }
 
   private getMergedBuffer(): string {
-    return this.finalTranscriptBuffer.join(" ").trim();
+    const merged = this.finalTranscriptBuffer.join(" ").trim();
+    if (merged !== "") {
+      return merged;
+    }
+    // Fallback: if no is_final was received, return the latest interim transcript
+    if (this.lastInterimTranscript.trim() !== "") {
+      console.log(`[STT] Using interim transcript fallback: "${this.lastInterimTranscript}"`);
+      return this.lastInterimTranscript.trim();
+    }
+    return "";
   }
 
   private clearFinalTimeout() {
@@ -174,8 +283,10 @@ export class SpeechToTextService {
 
   public clearBuffer() {
     this.finalTranscriptBuffer = [];
+    this.lastInterimTranscript = "";
     this.clearFinalTimeout();
     this.isWaitingForFinal = false;
     this.onFinalResultCallback = null;
   }
 }
+

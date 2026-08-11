@@ -12,31 +12,51 @@ export function useMicrophone({ onAudioChunk }: UseMicrophoneProps) {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
 
   const stopRecording = useCallback(() => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+    const mediaRecorder = mediaRecorderRef.current;
+    const stream = streamRef.current;
+
+    if (mediaRecorder && mediaRecorder.state !== "inactive") {
       try {
-        mediaRecorderRef.current.stop();
+        // Request any remaining buffered audio before stopping
+        if (mediaRecorder.state === "recording") {
+          mediaRecorder.requestData();
+        }
+        mediaRecorder.stop();
       } catch (err) {
         console.error("Failed to stop media recorder:", err);
       }
       mediaRecorderRef.current = null;
     }
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => {
-        try {
-          track.stop();
-        } catch (err) {
-          console.error("Failed to stop media stream track:", err);
-        }
-      });
-      streamRef.current = null;
-    }
+
+    // Give browser a short 100ms window to process ondataavailable before stopping stream tracks
+    setTimeout(() => {
+      if (stream) {
+        stream.getTracks().forEach((track) => {
+          try {
+            track.stop();
+          } catch (err) {
+            console.error("Failed to stop media stream track:", err);
+          }
+        });
+      }
+    }, 100);
+
+    streamRef.current = null;
     setIsRecording(false);
   }, []);
 
   const startRecording = useCallback(async () => {
     setError(null);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Enable noise suppression, echo cancellation, and auto gain control for high STT recognition accuracy
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          sampleRate: 16000
+        }
+      });
       streamRef.current = stream;
 
       // Identify standard codecs compatible with future STT integrations

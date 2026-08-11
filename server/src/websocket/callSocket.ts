@@ -13,6 +13,7 @@ interface SessionState {
   status: "idle" | "active" | "generating_report" | "ended";
   sttService: SpeechToTextService;
   abortController: AbortController;
+  audioChunkCount: number;
   isProcessingTurn: boolean;
   silenceCount: number;
   sttErrorSent: boolean;
@@ -92,7 +93,7 @@ export function initWebSocketServer(httpServer: Server) {
               sttService.createStream(
                 startMsg.language,
                 (text) => sendJson(ws, { type: "transcript_partial", text }),
-                (text) => sendJson(ws, { type: "transcript_final", text }),
+                (text) => sendJson(ws, { type: "transcript_partial", text }),
                 (err) => {
                   console.error("[STT] Deepgram client reported error:", err);
                   // Only send the first STT error to client to avoid flooding
@@ -123,7 +124,8 @@ export function initWebSocketServer(httpServer: Server) {
               abortController,
               isProcessingTurn: false,
               silenceCount: 0,
-              sttErrorSent: false
+              sttErrorSent: false,
+              audioChunkCount: 0
             };
 
             activeSessions.set(ws, sessionObj);
@@ -179,6 +181,10 @@ export function initWebSocketServer(httpServer: Server) {
 
             try {
               const buffer = Buffer.from(audioMsg.data, "base64");
+              session.audioChunkCount++;
+              if (session.audioChunkCount % 10 === 1) {
+                console.log(`[WS] Audio chunk #${session.audioChunkCount} received (${buffer.length} bytes), STT connected=${session.sttService.getConnectionStatus()}`);
+              }
               session.sttService.sendAudioChunk(buffer);
             } catch (err) {
               console.error("[WS] Error forwarding audio chunk to STT:", err);
@@ -200,7 +206,8 @@ export function initWebSocketServer(httpServer: Server) {
 
             session.isProcessingTurn = true;
             session.silenceCount = 0; // Reset silence tracker on user turn
-            console.log(`[WS] Turn processing started for session: ${session.sessionId}.`);
+            console.log(`[WS] Turn processing started for session: ${session.sessionId}. Audio chunks received this turn: ${session.audioChunkCount}`);
+            session.audioChunkCount = 0;  // Reset for next turn
 
             sendJson(ws, {
               type: "status",
@@ -254,6 +261,7 @@ export function initWebSocketServer(httpServer: Server) {
 
                 // If completed or urgent, wrap up session and generate health report
                 if (decision.nextAction === "complete" || decision.nextAction === "urgent_attention") {
+                  session.isProcessingTurn = false;
                   // End STT connection early
                   try {
                     session.sttService.finishStream();
@@ -483,21 +491,19 @@ async function streamTtsToClient(
       type: "tts_error",
       message: "Voice playback is unavailable (Missing API Key). Continuing with text only."
     });
-    // Transition back to listening so call continues without audio
-    if (session.status === "active" && ws.readyState === WebSocket.OPEN) {
-      sendJson(ws, { type: "status", status: "listening" });
-    }
+    // Client's browser TTS onEnd callback will transition to "listening"
     return;
   }
 
   try {
-    sendJson(ws, { type: "audio_start", responseId });
-
     const audioStream = await ttsService.generateSpeechStream(
       text,
       session.language,
       session.abortController.signal
     );
+
+    // Only send audio_start AFTER TTS stream is successfully created
+    sendJson(ws, { type: "audio_start", responseId });
 
     for await (const chunk of audioStream) {
       // Race guard: If call has been terminated/aborted, end stream immediately
@@ -528,11 +534,8 @@ async function streamTtsToClient(
       type: "tts_error",
       message: "Voice playback failed. Continuing with text only."
     });
-    // Transition back to listening so call continues without crashing
-    if (session.status === "active" && ws.readyState === WebSocket.OPEN) {
-      sendJson(ws, { type: "audio_end", responseId });
-      sendJson(ws, { type: "status", status: "listening" });
-    }
+    // Do NOT send audio_end or status:listening here.
+    // The client's browser TTS fallback onEnd callback will transition to "listening".
   }
 }
 

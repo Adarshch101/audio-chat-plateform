@@ -276,6 +276,9 @@ export function CallScreen() {
             // When browser TTS finishes, transition to listening
             transitionStatus("listening");
           });
+        } else {
+          // No text to speak — go straight to listening
+          transitionStatus("listening");
         }
         break;
 

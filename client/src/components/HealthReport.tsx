@@ -52,11 +52,11 @@ export function HealthReport({ report, transcript, onNewScreening }: HealthRepor
       {/* Symptoms list */}
       <div className="flex flex-col gap-2">
         <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wide px-1">Key Symptoms Reported</h3>
-        {report.keySymptoms.length === 0 ? (
+        {(report.keySymptoms || []).length === 0 ? (
           <p className="text-sm text-slate-400 italic px-1">None reported</p>
         ) : (
           <ul className="grid grid-cols-1 md:grid-cols-2 gap-2 bg-slate-50 border border-slate-100 rounded-xl p-4 list-disc pl-8">
-            {report.keySymptoms.map((symptom, i) => (
+            {(report.keySymptoms || []).map((symptom, i) => (
               <li key={i} className="text-sm text-slate-600 font-medium capitalize">
                 {symptom}
               </li>
@@ -71,11 +71,11 @@ export function HealthReport({ report, transcript, onNewScreening }: HealthRepor
         <div className="flex flex-col gap-2">
           <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wide px-1">Follow-Up Attention Flags</h3>
           <div className="flex-1 bg-red-50/50 border border-red-100 rounded-xl p-4 flex flex-col gap-2">
-            {report.followUpFlags.length === 0 ? (
+            {(report.followUpFlags || []).length === 0 ? (
               <p className="text-sm text-slate-400 italic">No serious flags noted</p>
             ) : (
               <ul className="flex flex-col gap-2 list-none pl-0">
-                {report.followUpFlags.map((flag, i) => (
+                {(report.followUpFlags || []).map((flag, i) => (
                   <li key={i} className="text-sm text-red-700 font-medium flex gap-2 items-start">
                     <span className="text-red-500 mt-0.5">•</span>
                     <span>{flag}</span>
@@ -90,11 +90,11 @@ export function HealthReport({ report, transcript, onNewScreening }: HealthRepor
         <div className="flex flex-col gap-2">
           <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wide px-1">Missing Clinical Information</h3>
           <div className="flex-1 bg-amber-50/50 border border-amber-100 rounded-xl p-4 flex flex-col gap-2">
-            {report.missingInformation.length === 0 ? (
+            {(report.missingInformation || []).length === 0 ? (
               <p className="text-sm text-slate-400 italic">All basic variables gathered</p>
             ) : (
               <ul className="flex flex-col gap-2 list-none pl-0">
-                {report.missingInformation.map((info, i) => (
+                {(report.missingInformation || []).map((info, i) => (
                   <li key={i} className="text-sm text-amber-800 font-medium flex gap-2 items-start">
                     <span className="text-amber-500 mt-0.5">•</span>
                     <span>{info}</span>

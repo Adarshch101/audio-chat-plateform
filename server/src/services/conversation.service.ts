@@ -103,7 +103,7 @@ export class ConversationService {
         if (val !== null && val !== undefined) {
           if (key === "relatedSymptoms") {
             const currentSymptoms = currentData.relatedSymptoms || [];
-            const newSymptoms = Array.isArray(val) ? (val as string[]) : [];
+            const newSymptoms = Array.isArray(val) ? (val as string[]) : (typeof val === "string" ? [val] : []);
             // De-duplicate array merge
             const merged = Array.from(new Set([...currentSymptoms, ...newSymptoms]));
             currentData.relatedSymptoms = merged;
