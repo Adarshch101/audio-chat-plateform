@@ -6,6 +6,9 @@ import { SpeechToTextService } from "../services/stt.service";
 import { ConversationService } from "../services/conversation.service";
 import { TextToSpeechService } from "../services/tts.service";
 import { ReportService } from "../services/report.service";
+import { persistenceService } from "../services/persistence.setup";
+import { isWsAuthorized } from "../utils/security";
+import { detectLanguageFromText } from "../utils/language-utils";
 
 interface SessionState {
   sessionId: string;
@@ -13,10 +16,10 @@ interface SessionState {
   status: "idle" | "active" | "generating_report" | "ended";
   sttService: SpeechToTextService;
   abortController: AbortController;
+  reportAbortController?: AbortController;
   audioChunkCount: number;
   isProcessingTurn: boolean;
   silenceCount: number;
-  sttErrorSent: boolean;
 }
 
 const activeSessions = new Map<WebSocket, SessionState>();
@@ -28,6 +31,14 @@ export function initWebSocketServer(httpServer: Server) {
   const wss = new WebSocketServer({ server: httpServer });
 
   wss.on("connection", (ws: WebSocket) => {
+    // Reject unauthenticated connections when API auth is enabled. WS upgrades
+    // bypass CORS, so the token check must happen at the connection boundary.
+    if (!isWsAuthorized(ws.url)) {
+      console.warn("[WS] Rejected connection: missing or invalid auth token.");
+      ws.close(4401, "Unauthorized");
+      return;
+    }
+
     console.log("[WS] New client connected");
 
     ws.on("message", async (data: Buffer | string) => {
@@ -93,18 +104,12 @@ export function initWebSocketServer(httpServer: Server) {
               sttService.createStream(
                 startMsg.language,
                 (text) => sendJson(ws, { type: "transcript_partial", text }),
-                (text) => sendJson(ws, { type: "transcript_partial", text }),
+                (text) => sendJson(ws, { type: "transcript_final", text }),
                 (err) => {
-                  console.error("[STT] Deepgram client reported error:", err);
-                  // Only send the first STT error to client to avoid flooding
-                  const currentSession = activeSessions.get(ws);
-                  if (currentSession && !currentSession.sttErrorSent) {
-                    currentSession.sttErrorSent = true;
-                    sendJson(ws, {
-                      type: "error",
-                      message: "Speech recognition is temporarily unavailable."
-                    });
-                  }
+                  // Non-fatal: SpeechToTextService auto-reconnects, so we keep
+                  // the call alive instead of tearing it down. Only log the
+                  // first STT error to avoid flooding the console.
+                  console.error("[STT] Deepgram client reported error (auto-reconnect will attempt recovery):", err);
                 }
               );
             } catch (err) {
@@ -124,7 +129,6 @@ export function initWebSocketServer(httpServer: Server) {
               abortController,
               isProcessingTurn: false,
               silenceCount: 0,
-              sttErrorSent: false,
               audioChunkCount: 0
             };
 
@@ -225,53 +229,8 @@ export function initWebSocketServer(httpServer: Server) {
                 sendJson(ws, { type: "status", status: "listening" });
                 session.isProcessingTurn = false;
               } else {
-                // Confirm the consolidated text segment reaches the client UI
-                sendJson(ws, {
-                  type: "transcript_final",
-                  text: finalTranscript
-                });
-
-                // Process turn through Conversation Service (invokes OpenAI)
-                const decision = await conversationService.processUserTurn(
-                  session.sessionId,
-                  finalTranscript,
-                  session.abortController.signal
-                );
-
-                // Check abort state
-                if (session.abortController.signal.aborted) {
-                  return;
-                }
-
-                // Push text response to chat log
-                sendJson(ws, {
-                  type: "assistant_message",
-                  text: decision.spokenResponse
-                });
-
-                // Update state to speaking before starting stream
-                sendJson(ws, {
-                  type: "status",
-                  status: "speaking"
-                });
-
-                // Stream voice audio to client with responseId
-                const responseId = crypto.randomUUID();
-                await streamTtsToClient(ws, session, decision.spokenResponse, responseId);
-
-                // If completed or urgent, wrap up session and generate health report
-                if (decision.nextAction === "complete" || decision.nextAction === "urgent_attention") {
-                  session.isProcessingTurn = false;
-                  // End STT connection early
-                  try {
-                    session.sttService.finishStream();
-                  } catch (e) {}
-
-                  // Trigger Report Generation
-                  await triggerReportGeneration(ws, session);
-                } else {
-                  session.isProcessingTurn = false;
-                }
+                applyDetectedLanguage(ws, session, finalTranscript, "speech");
+                await processTurnText(ws, session, finalTranscript);
               }
 
               // Clear local recorder buffers
@@ -284,6 +243,52 @@ export function initWebSocketServer(httpServer: Server) {
                 return;
               }
               console.error("[ERROR] STT turn processing error:", err);
+              sendError(ws, "Something went wrong while processing your response.");
+              sendJson(ws, {
+                type: "status",
+                status: "listening"
+              });
+            }
+            break;
+          }
+
+          case "text_message": {
+            if (!session || session.status !== "active") {
+              sendError(ws, "No active session found. Please start a call first.");
+              return;
+            }
+
+            const textMsg = clientMessage as Extract<ClientMessage, { type: "text_message" }>;
+            if (!textMsg.text || typeof textMsg.text !== "string" || textMsg.text.trim() === "") {
+              sendError(ws, "Malformed payload: Missing or empty 'text' field for text message.");
+              return;
+            }
+
+            // Idempotency lock
+            if (session.isProcessingTurn) {
+              console.log("[WS] Turn already processing. Ignoring text_message.");
+              return;
+            }
+
+            session.isProcessingTurn = true;
+            session.silenceCount = 0; // Reset silence tracker on user input
+            console.log(`[WS] Text turn received for session: ${session.sessionId}: "${textMsg.text.trim()}"`);
+
+            sendJson(ws, {
+              type: "status",
+              status: "processing"
+            });
+
+            try {
+              applyDetectedLanguage(ws, session, textMsg.text.trim(), "text");
+              await processTurnText(ws, session, textMsg.text.trim());
+            } catch (err: any) {
+              session.isProcessingTurn = false;
+              if (err.name === "AbortError") {
+                console.log("[WS] Processing text turn aborted.");
+                return;
+              }
+              console.error("[ERROR] Text turn processing error:", err);
               sendError(ws, "Something went wrong while processing your response.");
               sendJson(ws, {
                 type: "status",
@@ -395,6 +400,7 @@ export function initWebSocketServer(httpServer: Server) {
         console.log(`[WS] Client disconnected. Cleaning up session: ${session.sessionId}`);
         session.status = "ended";
         session.abortController.abort(); // Cancel pending API calls instantly
+        session.reportAbortController?.abort(); // Cancel any in-flight report compilation
         try {
           session.sttService.finishStream();
         } catch (e) {}
@@ -411,6 +417,7 @@ export function initWebSocketServer(httpServer: Server) {
       if (session) {
         session.status = "ended";
         session.abortController.abort();
+        session.reportAbortController?.abort();
         try {
           session.sttService.finishStream();
         } catch (e) {}
@@ -442,10 +449,21 @@ async function triggerReportGeneration(ws: WebSocket, session: SessionState) {
 
   // Create a new AbortController for report to support cancel on closed socket
   const reportAbortController = new AbortController();
+  session.reportAbortController = reportAbortController;
 
   try {
     const report = await reportService.generateReport(fullSession, reportAbortController.signal);
     fullSession.report = report;
+    session.reportAbortController = undefined;
+
+    // Persist the completed session + report so it survives server restarts.
+    try {
+      fullSession.reviewStatus = fullSession.reviewStatus ?? "pending";
+      await persistenceService.saveSession(fullSession);
+      console.log(`[PERSIST] Saved session ${session.sessionId} to disk.`);
+    } catch (persistErr) {
+      console.error(`[PERSIST] Failed to persist session ${session.sessionId}:`, persistErr);
+    }
 
     // Send final report
     sendJson(ws, {
@@ -469,10 +487,66 @@ async function triggerReportGeneration(ws: WebSocket, session: SessionState) {
     console.error("[REPORT] Generation failed completely:", err);
     session.status = "active"; // Restore back to active so user can trigger retry
     session.isProcessingTurn = false;
+    session.reportAbortController = undefined;
     sendJson(ws, {
       type: "report_failed",
       message: "We couldn't generate the full report. Please try again."
     });
+  }
+}
+
+/**
+ * Processes a finalized user turn (voice transcript or typed text) through the
+ * Conversation Service, streams the spoken reply, and wraps up the session if
+ * the intake is complete or urgent.
+ */
+async function processTurnText(ws: WebSocket, session: SessionState, text: string) {
+  // Confirm the consolidated text segment reaches the client UI
+  sendJson(ws, {
+    type: "transcript_final",
+    text
+  });
+
+  // Process turn through Conversation Service (invokes OpenAI)
+  const decision = await conversationService.processUserTurn(
+    session.sessionId,
+    text,
+    session.abortController.signal
+  );
+
+  // Check abort state
+  if (session.abortController.signal.aborted) {
+    return;
+  }
+
+  // Push text response to chat log
+  sendJson(ws, {
+    type: "assistant_message",
+    text: decision.spokenResponse
+  });
+
+  // Update state to speaking before starting stream
+  sendJson(ws, {
+    type: "status",
+    status: "speaking"
+  });
+
+  // Stream voice audio to client with responseId
+  const responseId = crypto.randomUUID();
+  await streamTtsToClient(ws, session, decision.spokenResponse, responseId);
+
+  // If completed or urgent, wrap up session and generate health report
+  if (decision.nextAction === "complete" || decision.nextAction === "urgent_attention") {
+    session.isProcessingTurn = false;
+    // End STT connection early
+    try {
+      session.sttService.finishStream();
+    } catch (e) {}
+
+    // Trigger Report Generation
+    await triggerReportGeneration(ws, session);
+  } else {
+    session.isProcessingTurn = false;
   }
 }
 
@@ -543,6 +617,27 @@ function isNoiseOnly(text: string): boolean {
   const clean = text.trim().toLowerCase().replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?]/g, "");
   const noise = new Set(["uh", "um", "ah", "er", "oh"]);
   return noise.has(clean);
+}
+
+/**
+ * Detects the user's language (English vs Hindi) from their spoken transcript
+ * or typed text and, when it differs from the session language, switches the
+ * conversation language. The switch takes effect immediately: the LLM prompt,
+ * deterministic follow-up questions, and TTS voice all respond in the detected
+ * language, and the client is notified so its UI reflects the change.
+ */
+function applyDetectedLanguage(ws: WebSocket, session: SessionState, text: string, source: "speech" | "text") {
+  const detected = detectLanguageFromText(text);
+  if (detected !== session.language) {
+    console.log(`[LANG] Auto-detected ${detected} (was ${session.language}) from ${source} input: "${text}"`);
+    session.language = detected;
+    conversationService.updateLanguage(session.sessionId, detected);
+    sendJson(ws, {
+      type: "language_detected",
+      language: detected,
+      source
+    });
+  }
 }
 
 function sendJson(ws: WebSocket, message: ServerMessage) {

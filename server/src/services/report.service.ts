@@ -1,54 +1,31 @@
-import OpenAI from "openai";
 import { HealthSession } from "../types/session.types";
 import { HealthReport, HealthReportSchema } from "../schemas/report.schema";
 import { REPORT_PROMPT } from "../prompts/report.prompt";
+import { parseJsonResponse } from "../utils/json";
+import { completeWithFallback, resolveLlmCandidates } from "../config/llm";
+import type { LlmCandidate } from "../config/llm";
 
-/**
- * Resolves the best available LLM client and model for report generation.
- * Priority: Groq (free, fast, OpenAI-compatible) > OpenAI
- */
-function resolveLlmClient(): { client: OpenAI; model: string; provider: string } | null {
-  // Priority 1: Groq
-  const groqKey = process.env.GROQ_API_KEY;
-  if (groqKey) {
-    return {
-      client: new OpenAI({
-        apiKey: groqKey,
-        baseURL: "https://api.groq.com/openai/v1"
-      }),
-      model: process.env.GROQ_MODEL || "llama-3.1-8b-instant",
-      provider: "Groq"
-    };
-  }
+// Budget for a single report compilation, mirroring the conversation-turn
+// timeout so a hung provider surfaces as a retryable failure.
+const REPORT_TIMEOUT_MS = Number(process.env.REPORT_TIMEOUT_MS) || 60000;
 
-  // Priority 2: OpenAI
-  const openaiKey = process.env.OPENAI_API_KEY;
-  if (openaiKey) {
-    return {
-      client: new OpenAI({ apiKey: openaiKey }),
-      model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-      provider: "OpenAI"
-    };
-  }
-
-  return null;
-}
+// Reports only need the most recent dialogue; replaying an entire long
+// transcript risks blowing the context/token budget and permanently failing
+// report generation. Mirror the conversation history bound.
+const REPORT_HISTORY_LIMIT = 20;
 
 export class ReportService {
-  private client: OpenAI | null = null;
-  private model: string = "";
-  private provider: string = "";
+  private candidates: LlmCandidate[] = [];
   private initialized: boolean = false;
 
   private ensureInit() {
     if (this.initialized) return;
     this.initialized = true;
-    const resolved = resolveLlmClient();
-    if (resolved) {
-      this.client = resolved.client;
-      this.model = resolved.model;
-      this.provider = resolved.provider;
-      console.log(`[REPORT] Using ${this.provider} with model: ${this.model}`);
+    this.candidates = resolveLlmCandidates();
+    if (this.candidates.length > 0) {
+      console.log(
+        `[REPORT] Available models: ${this.candidates.map((c) => `${c.provider}:${c.model}`).join(" -> ")}`
+      );
     }
   }
 
@@ -64,18 +41,19 @@ export class ReportService {
       throw new Error("[CHAOS] Simulated Report failure.");
     }
 
-    if (!this.client) {
+    if (this.candidates.length === 0) {
       throw new Error("No LLM API key is configured (GROQ_API_KEY or OPENAI_API_KEY required).");
     }
 
-    const maxRetries = 1;
-    let attempt = 0;
-
-    // Filter conversation logs to keep payload size optimal
-    const formattedHistory = session.conversation.map((turn) => ({
-      role: turn.role,
-      text: turn.text
-    }));
+    // Filter conversation logs to keep payload size optimal. Only the most
+    // recent turns are needed for a summary; older turns cost tokens without
+    // improving the output.
+    const formattedHistory = session.conversation
+      .slice(-REPORT_HISTORY_LIMIT)
+      .map((turn) => ({
+        role: turn.role,
+        text: turn.text
+      }));
 
     const inputContext = {
       language: session.language,
@@ -83,46 +61,23 @@ export class ReportService {
       conversationHistory: formattedHistory
     };
 
-    while (attempt <= maxRetries) {
-      try {
-        console.log(`[REPORT] Requesting ${this.provider} summary compilation using ${this.model} (Attempt ${attempt + 1})...`);
+    // Run against every configured model in order; if the primary is rate
+    // limited or quota-exhausted the next model picks up the report.
+    const content = await completeWithFallback(this.candidates, {
+      systemPrompt: REPORT_PROMPT,
+      userContent: JSON.stringify(inputContext),
+      timeoutMs: REPORT_TIMEOUT_MS,
+      logTag: "REPORT",
+      temperature: 0.1, // Keep temperature minimal to ensure neutral, non-hallucinated summarization
+      signal
+    });
 
-        const response = await this.client.chat.completions.create({
-          model: this.model,
-          response_format: { type: "json_object" },
-          messages: [
-            { role: "system", content: REPORT_PROMPT },
-            { role: "user", content: JSON.stringify(inputContext) }
-          ],
-          temperature: 0.1 // Keep temperature minimal to ensure neutral, non-hallucinated summarization
-        }, { signal });
+    // Parse (fence/prose tolerant) and validate using Zod
+    const parsed = parseJsonResponse(content);
+    const report = HealthReportSchema.parse(parsed);
 
-        const content = response.choices[0].message.content;
-        if (!content) {
-          throw new Error(`${this.provider} returned an empty content body for report generation.`);
-        }
-
-        // Validate using Zod
-        const parsed = JSON.parse(content);
-        const report = HealthReportSchema.parse(parsed);
-
-        console.log("[REPORT] Structured report compiled and validated successfully.");
-        return report;
-
-      } catch (err) {
-        if (err instanceof Error && err.name === "AbortError") {
-          console.log("[REPORT] Report compilation request was aborted.");
-          throw err;
-        }
-        console.warn(`[REPORT] Attempt ${attempt + 1} failed:`, err);
-        attempt++;
-        if (attempt > maxRetries) {
-          throw err;
-        }
-      }
-    }
-
-    throw new Error("Failed to compile valid structured report.");
+    console.log("[REPORT] Structured report compiled and validated successfully.");
+    return report;
   }
 }
 export default ReportService;

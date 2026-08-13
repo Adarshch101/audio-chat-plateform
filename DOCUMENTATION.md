@@ -21,6 +21,7 @@ health-voice-agent/ (Workspace Root)
 │   │   │   ├── useWebSocket.ts  # Connection lifecycle, event listeners, and auto-cleanup hook
 │   │   │   ├── useMicrophone.ts # Request mic stream, interval slicing, and Base64 encoder
 │   │   │   ├── useAudioPlayer.ts # Sequential playback queue, Blob builders, responseId filters
+│   │   │   ├── useBrowserTTS.ts  # Web Speech API fallback when ElevenLabs is unavailable
 │   │   │   └── useSilenceTimer.ts # Two-tier silence inactivity timer hook
 │   │   ├── services/            # API/WebSocket client integrations (future)
 │   │   ├── types/               # Type definitions
@@ -81,6 +82,7 @@ health-voice-agent/ (Workspace Root)
 * **ws v8.18.0**: Robust WebSocket server implementation.
 * **@deepgram/sdk z3.9.0**: Official Speech-to-Text streaming SDK.
 * **openai ^4.55.0**: Official OpenAI Node SDK for chat completions.
+* **Groq API (llama-3.3-70b-versatile)**: Primary LLM provider via the OpenAI-compatible SDK. Falls back to OpenAI (gpt-4o-mini) when `GROQ_API_KEY` is not set.
 * **zod ^3.23.8**: Schema-based JSON validation tool.
 * **CORS v2.8.5**: Cross-Origin Resource Sharing middleware.
 * **dotenv v16.4.5**: Local configuration environments loader.
@@ -102,6 +104,10 @@ Sent from React frontend to Express backend:
 * **`audio_chunk`**: Incremental audio stream data block.
   ```json
   { "type": "audio_chunk", "data": "BASE64_STRING" }
+  ```
+* **`text_message`**: Typed response from the user, processed the same way as a voice turn.
+  ```json
+  { "type": "text_message", "text": "user typed response" }
   ```
 * **`end_turn`**: Signals user finished speaking and triggers final STT compile.
   ```json
@@ -196,4 +202,5 @@ The client status transitions:
 * **Safe WS Send Wrapper**: Emits messages only when `ws.readyState === WebSocket.OPEN`, avoiding uncaught closed connection exceptions.
 * **Session AbortControllers**: Linked to each call session. When ending calls or closing sockets, abort controller instantly triggers `.abort()`, stopping OpenAI text completion, ElevenLabs fetches, and report requests, reclaiming server resources immediately.
 * **Idempotency Locks**: Drops duplicate `end_turn` signals if session status is already processing a turn. Ignores duplicate `end_call` messages if a report compilation is currently active.
+* **STT Resilience**: Deepgram stream errors are non-fatal. The `SpeechToTextService` auto-reconnects and the call continues; silent or noise-only turns are surfaced via `stt_empty` instead of terminating the session.
 * **Chaos Testing Modes**: Developers can configure environment switches (`SIMULATE_STT_FAILURE`, `SIMULATE_LLM_FAILURE`, etc.) in `.env` to simulate service failures.

@@ -6,6 +6,10 @@ export function useWebSocket() {
   const [lastMessage, setLastMessage] = useState<ServerMessage | null>(null);
   const [error, setError] = useState<string | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  // Queue of incoming messages. React batches rapid setState calls, so relying on a
+  // single "lastMessage" state slot would silently drop intermediate messages when a
+  // burst arrives (e.g. status + transcript_final + assistant_message + audio frames).
+  const messageQueueRef = useRef<ServerMessage[]>([]);
 
   const disconnect = useCallback(() => {
     if (wsRef.current) {
@@ -17,6 +21,7 @@ export function useWebSocket() {
       wsRef.current.close();
       wsRef.current = null;
     }
+    messageQueueRef.current = [];
     setIsConnected(false);
   }, []);
 
@@ -26,6 +31,13 @@ export function useWebSocket() {
     setLastMessage(null);
 
     try {
+      // Optional bearer token for the WS upgrade (mirrors REST API auth).
+      const apiToken = import.meta.env.VITE_API_TOKEN as string | undefined;
+      if (apiToken) {
+        const sep = url.includes("?") ? "&" : "?";
+        url = `${url}${sep}token=${encodeURIComponent(apiToken)}`;
+      }
+
       const ws = new WebSocket(url);
       wsRef.current = ws;
 
@@ -37,6 +49,8 @@ export function useWebSocket() {
       ws.onmessage = (event) => {
         try {
           const message = JSON.parse(event.data) as ServerMessage;
+          // Enqueue every message so none are lost to React state batching
+          messageQueueRef.current.push(message);
           setLastMessage(message);
         } catch (err) {
           console.error("Failed to parse incoming WebSocket message:", err);
@@ -69,6 +83,11 @@ export function useWebSocket() {
     }
   }, []);
 
+  // Atomically pull the next queued message (or null when empty).
+  const takeNextMessage = useCallback((): ServerMessage | null => {
+    return messageQueueRef.current.shift() ?? null;
+  }, []);
+
   useEffect(() => {
     return () => {
       if (wsRef.current) {
@@ -83,6 +102,7 @@ export function useWebSocket() {
     disconnect,
     sendMessage,
     lastMessage,
+    takeNextMessage,
     error,
     setError
   };

@@ -20,8 +20,28 @@ You must output a single, valid JSON object matching the following Zod schema. D
   "mainConcern": "Primary reason for contact (or null if not provided)",
   "duration": "Length of time concern has been present (or null if not provided)",
   "severity": "Reported severity (e.g., '7/10', 'severe') (or null if not provided)",
+  "onset": "Reported onset pattern: sudden or gradual (or null if not discussed)",
+  "smokingStatus": "Reported smoking/tobacco status: never, former, current, or details (or null if not discussed)",
   "keySymptoms": [
     "List of symptoms explicitly reported by the user"
+  ],
+  "medications": [
+    "Medications the user reported currently taking (or empty array if none/not discussed)"
+  ],
+  "allergies": [
+    "Allergies the user reported (or empty array if none/not discussed)"
+  ],
+  "medicalHistory": [
+    "Ongoing or past medical conditions reported (or empty array if none/not discussed)"
+  ],
+  "familyHistory": [
+    "Relevant familial conditions reported (or empty array if none/not discussed)"
+  ],
+  "triggers": [
+    "Reported factors that worsen or relieve symptoms (or empty array if none/not discussed)"
+  ],
+  "vitals": [
+    "Reported vitals such as temperature, blood pressure, or heart rate (or empty array if none/not discussed)"
   ],
   "additionalContext": [
     "List of other relevant details discussed (e.g., triggers, previous occurrences)"

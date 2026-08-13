@@ -1,14 +1,16 @@
 import dotenv from "dotenv";
 import path from "path";
 
-// Load environment variables immediately before importing services or socket controllers
+// Load environment variables immediately before importing the app or services.
+// (The TypeScript output is CommonJS, so this runs before any module below.)
 dotenv.config();
 dotenv.config({ path: path.resolve(process.cwd(), "../.env") });
 dotenv.config({ path: path.resolve(process.cwd(), "./.env") });
 
-import express, { Request, Response, NextFunction } from "express";
-import cors from "cors";
+import type { Server } from "http";
+import { createApp } from "./app";
 import { initWebSocketServer } from "./websocket/callSocket";
+import { initPersistence, closePersistence } from "./services/persistence.setup";
 
 if (!process.env.DEEPGRAM_API_KEY) {
   console.warn("[STT WARNING] DEEPGRAM_API_KEY is not configured.");
@@ -34,48 +36,35 @@ if (!process.env.ELEVENLABS_HINDI_VOICE_ID) {
   console.warn("[TTS WARNING] ELEVENLABS_HINDI_VOICE_ID is not configured. Hindi voice synthesis will fallback to default voice.");
 }
 
-const app = express();
+const app = createApp();
 const PORT = process.env.PORT || 5000;
 
-// Middleware
-app.use(cors());
-app.use(express.json());
+let server: Server | undefined;
 
-// Health check endpoint
-app.get("/health", (req: Request, res: Response) => {
-  res.json({ status: "ok" });
+async function start(): Promise<void> {
+  await initPersistence();
+
+  server = app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+
+  // Initialize WebSocket Server
+  initWebSocketServer(server);
+}
+
+void start().catch((err) => {
+  console.error("Failed to start server:", err);
+  process.exit(1);
 });
-
-// 404 Route handler
-app.use((req: Request, res: Response) => {
-  res.status(404).json({ error: "Not Found" });
-});
-
-// Error handling middleware
-app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
-  console.error("Unhandled server error:", err);
-  res.status(500).json({ error: "Internal Server Error" });
-});
-
-// Start the server
-const server = app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
-
-// Initialize WebSocket Server
-initWebSocketServer(server);
 
 // Handle graceful shutdown
-process.on("SIGTERM", () => {
-  console.log("SIGTERM signal received: closing HTTP server");
-  server.close(() => {
+function shutdown(signal: string): void {
+  console.log(`${signal} signal received: closing HTTP server`);
+  server?.close(() => {
     console.log("HTTP server closed");
   });
-});
+  void closePersistence().finally(() => process.exit(0));
+}
 
-process.on("SIGINT", () => {
-  console.log("SIGINT signal received: closing HTTP server");
-  server.close(() => {
-    console.log("HTTP server closed");
-  });
-});
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));

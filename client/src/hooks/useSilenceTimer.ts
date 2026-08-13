@@ -6,13 +6,15 @@ interface UseSilenceTimerProps {
   onSecondTimeout: () => void;
   status: CallStatus;
   isRecording: boolean;
+  disabled?: boolean;
 }
 
 export function useSilenceTimer({
   onFirstTimeout,
   onSecondTimeout,
   status,
-  isRecording
+  isRecording,
+  disabled
 }: UseSilenceTimerProps) {
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const silencePhaseRef = useRef<number>(0); // 0 = none, 1 = first warning sent
@@ -43,6 +45,12 @@ export function useSilenceTimer({
   };
 
   useEffect(() => {
+    // Do not monitor silence while the user is actively typing a message
+    if (disabled) {
+      clearTimer();
+      return () => clearTimer();
+    }
+
     // We only monitor silence during listening states when the user is not actively recording
     if (status === "listening" && !isRecording) {
       // If we are already in phase 1 (warning spoken), wait for the second timeout
@@ -60,7 +68,7 @@ export function useSilenceTimer({
     }
 
     return () => clearTimer();
-  }, [status, isRecording]);
+  }, [status, isRecording, disabled]);
 
   const reset = () => {
     clearTimer();

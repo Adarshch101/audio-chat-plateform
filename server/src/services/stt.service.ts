@@ -1,5 +1,26 @@
 import { createClient, LiveClient, LiveTranscriptionEvents } from "@deepgram/sdk";
 
+type SttLanguageCode = "en" | "hi" | "multi";
+type SttModelName = "nova-2" | "nova-3";
+
+interface SttConfig {
+  model: SttModelName;
+  language: SttLanguageCode;
+}
+
+function resolveSttConfig(): SttConfig {
+  const modelInput = (process.env.STT_MODEL || "nova-3").trim();
+  const model: SttModelName = modelInput === "nova-2" ? "nova-2" : "nova-3";
+
+  // "multi" enables in-stream language auto-detection (English + Hindi via
+  // Nova-3's real-time code switching). Pin to "en" or "hi" to disable it.
+  const languageInput = (process.env.STT_LANGUAGE || "multi").trim();
+  const language: SttLanguageCode =
+    languageInput === "en" || languageInput === "hi" ? languageInput : "multi";
+
+  return { model, language };
+}
+
 export class SpeechToTextService {
   private client: LiveClient | null = null;
   private apiKey: string;
@@ -14,7 +35,6 @@ export class SpeechToTextService {
   private finalCheckTimeout: NodeJS.Timeout | null = null;
 
   // Reconnect support: store stream config so we can recreate on drop
-  private lastLanguage: "en" | "hi" = "en";
   private lastOnPartial: ((text: string) => void) | null = null;
   private lastOnFinal: ((text: string) => void) | null = null;
   private lastOnError: ((err: unknown) => void) | null = null;
@@ -34,7 +54,7 @@ export class SpeechToTextService {
   }
 
   public createStream(
-    language: "en" | "hi",
+    _language: "en" | "hi",
     onTranscriptPartial: (text: string) => void,
     onTranscriptFinal: (text: string) => void,
     onError: (err: unknown) => void
@@ -52,8 +72,12 @@ export class SpeechToTextService {
       return;
     }
 
+    // The stream is configured with the resolved STT model/language (see
+    // resolveSttConfig below). The caller-supplied language only seeds the
+    // session's initial greeting; spoken input is auto-detected in-stream.
+    const config = resolveSttConfig();
+
     // Store config for reconnection
-    this.lastLanguage = language;
     this.lastOnPartial = onTranscriptPartial;
     this.lastOnFinal = onTranscriptFinal;
     this.lastOnError = onError;
@@ -62,11 +86,11 @@ export class SpeechToTextService {
     this.isConnected = false;
     this.isSessionActive = true;
 
-    this.initConnection(language, onTranscriptPartial, onTranscriptFinal, onError);
+    this.initConnection(config, onTranscriptPartial, onTranscriptFinal, onError);
   }
 
   private initConnection(
-    language: "en" | "hi",
+    config: SttConfig,
     onTranscriptPartial: (text: string) => void,
     onTranscriptFinal: (text: string) => void,
     onError: (err: unknown) => void
@@ -83,16 +107,18 @@ export class SpeechToTextService {
 
     try {
       const deepgram = createClient(this.apiKey);
-      const languageCode = language === "hi" ? "hi" : "en-US";
 
-      console.log(`[STT] Opening Deepgram connection for language: ${languageCode}`);
+      console.log(`[STT] Opening Deepgram connection with model=${config.model}, language=${config.language}`);
 
       this.client = deepgram.listen.live({
-        model: "nova-2",
-        language: languageCode,
+        model: config.model,
+        language: config.language,
         smart_format: true,
         interim_results: true,
-        punctuation: true
+        punctuation: true,
+        // Short endpointing helps the multilingual model segment utterances
+        // quickly so language switching is picked up turn-by-turn.
+        endpointing: config.language === "multi" ? 100 : undefined
       });
 
       this.client.on(LiveTranscriptionEvents.Open, () => {
@@ -179,7 +205,7 @@ export class SpeechToTextService {
       this.reconnectTimer = null;
       if (this.isSessionActive && !this.isConnected && this.lastOnPartial && this.lastOnFinal && this.lastOnError) {
         console.log("[STT] Auto-reconnecting to Deepgram...");
-        this.initConnection(this.lastLanguage, this.lastOnPartial, this.lastOnFinal, this.lastOnError);
+        this.initConnection(resolveSttConfig(), this.lastOnPartial, this.lastOnFinal, this.lastOnError);
       }
     }, 1000);
   }

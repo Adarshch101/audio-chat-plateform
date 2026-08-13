@@ -23,6 +23,10 @@ export type ClientMessage =
       data: string; // Base64 chunk
     }
   | {
+      type: "text_message";
+      text: string;
+    }
+  | {
       type: "end_turn";
     }
   | {
@@ -58,6 +62,11 @@ export type ServerMessage =
     }
   | {
       type: "stt_empty";
+    }
+  | {
+      type: "language_detected";
+      language: "en" | "hi";
+      source: "speech" | "text";
     }
   | {
       type: "audio_start";

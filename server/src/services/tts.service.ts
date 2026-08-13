@@ -69,7 +69,7 @@ export class TextToSpeechService {
       });
 
       if (!response.ok) {
-        const errorText = await response.text();
+        await response.text();
         console.warn(`[TTS] ElevenLabs API failed (${response.status}). Trying OpenAI TTS fallback...`);
         return await this.generateOpenAiSpeechStream(text, signal);
       }

@@ -1,3 +1,5 @@
+import type { HealthReport } from "./session";
+
 export type CallStatus =
   | "idle"
   | "connecting"
@@ -10,19 +12,6 @@ export type CallStatus =
   | "report_ready"
   | "error"
   | "ended";
-
-export interface HealthReport {
-  patientName: string | null;
-  mainConcern: string | null;
-  duration: string | null;
-  severity: string | null;
-  keySymptoms: string[];
-  additionalContext: string[];
-  followUpFlags: string[];
-  missingInformation: string[];
-  summary: string;
-  disclaimer: string;
-}
 
 export interface AppError {
   code:
@@ -47,6 +36,10 @@ export type ClientMessage =
   | {
       type: "audio_chunk";
       data: string; // Base64 chunk
+    }
+  | {
+      type: "text_message";
+      text: string;
     }
   | {
       type: "end_turn";
@@ -84,6 +77,11 @@ export type ServerMessage =
     }
   | {
       type: "stt_empty";
+    }
+  | {
+      type: "language_detected";
+      language: "en" | "hi";
+      source: "speech" | "text";
     }
   | {
       type: "audio_start";

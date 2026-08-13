@@ -121,13 +121,13 @@ export function useMicrophone({ onAudioChunk }: UseMicrophoneProps) {
       if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
         try {
           mediaRecorderRef.current.stop();
-        } catch (e) {}
+        } catch {}
       }
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((track) => {
           try {
             track.stop();
-          } catch (e) {}
+          } catch {}
         });
       }
     };

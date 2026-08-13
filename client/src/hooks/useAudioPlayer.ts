@@ -139,7 +139,7 @@ export function useAudioPlayer(options: UseAudioPlayerOptions = {}) {
     if (audioRef.current) {
       try {
         audioRef.current.pause();
-      } catch (e) {}
+      } catch {}
       audioRef.current = null;
     }
 
@@ -147,7 +147,7 @@ export function useAudioPlayer(options: UseAudioPlayerOptions = {}) {
     queueRef.current.forEach((item) => {
       try {
         URL.revokeObjectURL(item.url);
-      } catch (e) {}
+      } catch {}
     });
 
     queueRef.current = [];

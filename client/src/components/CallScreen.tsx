@@ -1,439 +1,46 @@
-import { useEffect, useState, useRef, useCallback } from "react";
-import useWebSocket from "../hooks/useWebSocket";
-import useMicrophone from "../hooks/useMicrophone";
-import useAudioPlayer from "../hooks/useAudioPlayer";
-import useSilenceTimer from "../hooks/useSilenceTimer";
-import useBrowserTTS from "../hooks/useBrowserTTS";
+import { useEffect, useRef } from "react";
+import useCallSession from "../hooks/useCallSession";
 import MicrophoneButton from "./MicrophoneButton";
 import HealthReport from "./HealthReport";
-import type { CallStatus, HealthReport as HealthReportType, ClientMessage, AppError } from "../types/websocket";
+import Spinner from "./Spinner";
 
+// View-only: renders the call UI and delegates every piece of interaction
+// state/orchestration to the useCallSession controller hook.
 export function CallScreen() {
   const {
-    isConnected,
-    connect,
-    disconnect,
-    sendMessage,
-    lastMessage,
-    error: wsError,
-    setError: setWsError
-  } = useWebSocket();
-
-  const [status, setStatus] = useState<CallStatus>("idle");
-  const [language, setLanguage] = useState<"en" | "hi">("en");
-  const [sessionId, setSessionId] = useState<string | null>(null);
-  const [chatLog, setChatLog] = useState<{ sender: "user" | "assistant"; text: string; timestamp: number }[]>([]);
-  const [interimText, setInterimText] = useState<string>("");
-  const chatEndRef = useRef<HTMLDivElement | null>(null);
-
-  // Health report states
-  const [reportStatus, setReportStatus] = useState<"idle" | "generating" | "ready" | "failed">("idle");
-  const [generatedReport, setGeneratedReport] = useState<HealthReportType | null>(null);
-
-  // App error states
-  const [appError, setAppError] = useState<AppError | null>(null);
-
-  // Call duration counter
-  const [callDuration, setCallDuration] = useState<number>(0);
-  const durationIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  // Refs for postponed reports
-  const storedReportRef = useRef<HealthReportType | null>(null);
-  const [isCallEnding, setIsCallEnding] = useState(false);
-  const isCallEndingRef = useRef(false);
-
-  // Browser TTS fallback (when ElevenLabs is unavailable)
-  const browserTTS = useBrowserTTS();
-  const ttsUnavailableRef = useRef(false);
-  const lastAssistantTextRef = useRef<string>("");
-  // Track processed message IDs to prevent duplicate processing in StrictMode
-  const processedMessageRef = useRef<string>("");
-
-  useEffect(() => {
-    isCallEndingRef.current = isCallEnding;
-  }, [isCallEnding]);
-
-  // Enforce strict call state machine transitions
-  const transitionStatus = (nextStatus: CallStatus) => {
-    const invalidTransitions: Record<CallStatus, CallStatus[]> = {
-      idle: [],
-      connecting: ["idle"],
-      greeting: ["idle"],
-      listening: ["idle"],
-      processing: ["idle"],
-      speaking: ["idle"],
-      ending: [],
-      generating_report: ["idle"],
-      report_ready: [],
-      error: [],
-      ended: []
-    };
-
-    const blockList = invalidTransitions[status] || [];
-    if (blockList.includes(nextStatus)) {
-      console.warn(`[STATE] Blocked invalid status transition: ${status} -> ${nextStatus}`);
-      return;
-    }
-    console.log(`[STATE] Transition: ${status} -> ${nextStatus}`);
-    setStatus(nextStatus);
-  };
-
-  // Safe Web Socket message sender wrapper
-  const safeSendMessage = (message: ClientMessage) => {
-    if (isConnected) {
-      sendMessage(message);
-    } else {
-      console.warn("[WS] Attempted to transmit message on closed WebSocket connection:", message);
-    }
-  };
-
-  // Audio Playback queue callback
-  const audioPlayer = useAudioPlayer({
-    onQueueDrained: () => {
-      if (isCallEndingRef.current) {
-        console.log("[CallScreen] Voice buffer drained. Transitioning to ended.");
-        setIsCallEnding(false);
-        stopRecording();
-        disconnect();
-        transitionStatus("ended");
-
-        if (storedReportRef.current) {
-          setGeneratedReport(storedReportRef.current);
-          setReportStatus("ready");
-          storedReportRef.current = null;
-        }
-      } else {
-        console.log("[CallScreen] Voice buffer drained. Unlocking microphone.");
-        transitionStatus("listening");
-      }
-    }
-  });
-
-  // Microphone stream recorder
-  const {
-    isRecording,
-    startRecording,
-    stopRecording,
-    error: micError,
-    setError: setMicError
-  } = useMicrophone({
-    onAudioChunk: (base64) => {
-      safeSendMessage({
-        type: "audio_chunk",
-        data: base64
-      });
-    }
-  });
-
-  // Wire Silence timer hook (Two-Tier timeout trigger)
-  const { reset: resetSilenceTimer } = useSilenceTimer({
-    onFirstTimeout: () => {
-      console.log("[CallScreen] Silence timer first warn.");
-      safeSendMessage({ type: "silence_ping" });
-    },
-    onSecondTimeout: () => {
-      console.log("[CallScreen] Silence timer second warn.");
-      safeSendMessage({ type: "silence_ping" });
-    },
     status,
-    isRecording
-  });
+    language,
+    setLanguage,
+    sessionId,
+    processingPhase,
+    isSpeaking,
+    chatLog,
+    interimText,
+    draftText,
+    setDraftText,
+    isRecording,
+    reportStatus,
+    generatedReport,
+    appError,
+    dismissError,
+    callDuration,
+    startCall,
+    endCall,
+    startRecordingTurn,
+    stopRecordingTurn,
+    sendText,
+    newScreening,
+    retryReport
+  } = useCallSession();
+
+  const chatEndRef = useRef<HTMLDivElement | null>(null);
 
   // Auto-scroll chat windows
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chatLog, interimText, status]);
 
-  // Handle call duration counter
-  useEffect(() => {
-    const isCallActive =
-      status !== "idle" &&
-      status !== "ended" &&
-      status !== "error" &&
-      status !== "report_ready" &&
-      status !== "generating_report";
-
-    if (isCallActive) {
-      if (!durationIntervalRef.current) {
-        setCallDuration(0);
-        durationIntervalRef.current = setInterval(() => {
-          setCallDuration((prev) => prev + 1);
-        }, 1000);
-      }
-    } else {
-      if (durationIntervalRef.current) {
-        clearInterval(durationIntervalRef.current);
-        durationIntervalRef.current = null;
-      }
-    }
-
-    return () => {
-      if (durationIntervalRef.current) {
-        clearInterval(durationIntervalRef.current);
-        durationIntervalRef.current = null;
-      }
-    };
-  }, [status]);
-
-  // Handle socket connection boot
-  useEffect(() => {
-    if (isConnected && status === "connecting") {
-      safeSendMessage({
-        type: "start_call",
-        language
-      });
-    }
-  }, [isConnected, status, language]);
-
-  // Unexpected WS disconnection cleanup
-  useEffect(() => {
-    if (!isConnected && status !== "idle" && status !== "ended" && status !== "error" && status !== "connecting" && reportStatus === "idle") {
-      console.log("[WS] Unexpected disconnect detected. Cleaning up.");
-      audioPlayer.stop();
-      stopRecording();
-      transitionStatus("error");
-      setWsError("Unexpectedly disconnected from server.");
-      setAppError({
-        code: "WEBSOCKET_ERROR",
-        message: "WebSocket connection dropped unexpectedly.",
-        recoverable: true
-      });
-    }
-  }, [isConnected, status, reportStatus]);
-
-  // Catch mic errors and propagate to error model
-  useEffect(() => {
-    if (micError) {
-      setAppError({
-        code: "MICROPHONE_DENIED",
-        message: micError,
-        recoverable: true
-      });
-    }
-  }, [micError]);
-
-  // Process server events and update UI state machine
-  useEffect(() => {
-    if (!lastMessage) return;
-
-    // Deduplicate: generate a fingerprint for this message to prevent double-processing in StrictMode
-    const msgFingerprint = JSON.stringify(lastMessage);
-    if (processedMessageRef.current === msgFingerprint) return;
-    processedMessageRef.current = msgFingerprint;
-
-    switch (lastMessage.type) {
-      case "call_started":
-        setSessionId(lastMessage.sessionId);
-        break;
-      case "status":
-        // Map server status directly to state machine wrapper
-        transitionStatus(lastMessage.status);
-        break;
-      case "assistant_message":
-        lastAssistantTextRef.current = lastMessage.text;
-        setChatLog((prev) => [
-          ...prev,
-          { sender: "assistant", text: lastMessage.text, timestamp: Date.now() }
-        ]);
-        break;
-      case "transcript_partial":
-        setInterimText(lastMessage.text);
-        break;
-      case "transcript_final":
-        setChatLog((prev) => [
-          ...prev,
-          { sender: "user", text: lastMessage.text, timestamp: Date.now() }
-        ]);
-        setInterimText("");
-        break;
-      case "stt_empty":
-        setChatLog((prev) => [
-          ...prev,
-          { sender: "assistant", text: language === "hi" ? "मुझे ठीक से समझ नहीं आया। कृपया दोबारा कहें।" : "I didn't quite catch that. Please try again.", timestamp: Date.now() }
-        ]);
-        setInterimText("");
-        break;
-
-      // Audio stream events
-      case "audio_start":
-        audioPlayer.setActiveResponseId(lastMessage.responseId);
-        transitionStatus("speaking");
-        break;
-      case "audio_chunk":
-        audioPlayer.addChunk(lastMessage.data, lastMessage.responseId);
-        break;
-      case "audio_end":
-        audioPlayer.setAudioEnd(lastMessage.responseId);
-        break;
-      case "tts_error":
-        // ElevenLabs failed — switch to browser TTS fallback
-        console.log("[TTS Fallback] ElevenLabs unavailable. Using browser speech synthesis.");
-        ttsUnavailableRef.current = true;
-        // Speak the last assistant message using browser TTS
-        if (lastAssistantTextRef.current) {
-          transitionStatus("speaking");
-          browserTTS.speak(lastAssistantTextRef.current, language, () => {
-            // When browser TTS finishes, transition to listening
-            transitionStatus("listening");
-          });
-        } else {
-          // No text to speak — go straight to listening
-          transitionStatus("listening");
-        }
-        break;
-
-      // Report stream events
-      case "report_generating":
-        setReportStatus("generating");
-        transitionStatus("generating_report");
-        break;
-      case "report_ready":
-        if (audioPlayer.isPlaying) {
-          storedReportRef.current = lastMessage.report;
-          setIsCallEnding(true);
-        } else {
-          setGeneratedReport(lastMessage.report);
-          setReportStatus("ready");
-          stopRecording();
-          disconnect();
-          transitionStatus("ended");
-        }
-        break;
-      case "report_failed":
-        setReportStatus("failed");
-        setAppError({
-          code: "REPORT_ERROR",
-          message: "Structured screening report compilation failed.",
-          recoverable: true
-        });
-        break;
-
-      case "call_ended":
-        if (audioPlayer.isPlaying) {
-          setIsCallEnding(true);
-        } else {
-          stopRecording();
-          disconnect();
-          transitionStatus("ended");
-        }
-        break;
-      case "error":
-        if (status !== "error" && status !== "ended" && status !== "idle") {
-          audioPlayer.stop();
-          stopRecording();
-          transitionStatus("error");
-          disconnect();
-          setAppError({
-            code: "SESSION_ERROR",
-            message: lastMessage.message,
-            recoverable: true
-          });
-        }
-        break;
-      default:
-        break;
-    }
-  }, [lastMessage, disconnect, stopRecording, audioPlayer, language]);
-
-  // Handle manual state changes on WebSocket issues
-  useEffect(() => {
-    if (wsError && !appError && status !== "error" && status !== "ended" && status !== "idle") {
-      audioPlayer.stop();
-      stopRecording();
-      transitionStatus("error");
-      disconnect();
-      setAppError({
-        code: "WEBSOCKET_ERROR",
-        message: wsError,
-        recoverable: true
-      });
-    }
-  }, [wsError, disconnect, stopRecording, audioPlayer, appError, status]);
-
-  const handleStartCall = () => {
-    audioPlayer.stop();
-    browserTTS.stop();
-    ttsUnavailableRef.current = false;
-    lastAssistantTextRef.current = "";
-    processedMessageRef.current = "";
-    setIsCallEnding(false);
-    storedReportRef.current = null;
-    setReportStatus("idle");
-    setGeneratedReport(null);
-    setChatLog([]);
-    setInterimText("");
-    setSessionId(null);
-    setWsError(null);
-    setMicError(null);
-    setAppError(null);
-    resetSilenceTimer();
-    setCallDuration(0);
-    transitionStatus("connecting");
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const host = window.location.hostname;
-    connect(`${protocol}//${host}:5000`);
-  };
-
-  const handleEndCall = () => {
-    audioPlayer.stop();
-    browserTTS.stop();
-    stopRecording();
-    setIsCallEnding(false);
-    setInterimText("");
-    resetSilenceTimer();
-    if (isConnected) {
-      safeSendMessage({ type: "end_call" });
-    } else {
-      disconnect();
-      transitionStatus("idle");
-    }
-  };
-
-  // Barge-In interrupt controller inside Push-to-Talk triggers
-  const handleStartRecording = () => {
-    const isAiSpeaking = status === "speaking" || status === "greeting";
-    
-    if ((status === "listening" || isAiSpeaking) && !isRecording) {
-      if (isAiSpeaking) {
-        console.log("[BARGE-IN] User speaking. Interrupting AI playback streams.");
-        audioPlayer.stop();
-        browserTTS.stop();
-        audioPlayer.setActiveResponseId(null); // Invalidate current responseId immediately
-        transitionStatus("listening");
-      }
-      setInterimText("");
-      startRecording();
-    }
-  };
-
-  const handleStopRecording = () => {
-    stopRecording();
-    safeSendMessage({ type: "end_turn" });
-  };
-
-  const handleNewScreening = () => {
-    audioPlayer.stop();
-    browserTTS.stop();
-    ttsUnavailableRef.current = false;
-    lastAssistantTextRef.current = "";
-    processedMessageRef.current = "";
-    setIsCallEnding(false);
-    storedReportRef.current = null;
-    setReportStatus("idle");
-    setGeneratedReport(null);
-    setChatLog([]);
-    setInterimText("");
-    setSessionId(null);
-    setWsError(null);
-    setMicError(null);
-    setAppError(null);
-    resetSilenceTimer();
-    setCallDuration(0);
-    disconnect();
-    transitionStatus("idle");
-  };
-
-  // Duration parser
+  // Duration parser (view helper)
   const formatDuration = (s: number) => {
     const mins = Math.floor(s / 60);
     const secs = s % 60;
@@ -442,50 +49,51 @@ export function CallScreen() {
 
   // Helper formats for status indicators
   const getStatusBadge = () => {
+    const base = "px-3 py-1 rounded-full text-xs font-semibold uppercase tracking-wider flex items-center gap-1.5 border";
     switch (status) {
       case "idle":
-        return <span className="bg-slate-100 text-slate-700 px-3 py-1 rounded-full text-xs font-semibold uppercase tracking-wider">Disconnected</span>;
+        return <span className={`${base} bg-white/5 border-white/10 text-slate-400`}>Disconnected</span>;
       case "connecting":
         return (
-          <span className="bg-amber-100 text-amber-800 px-3 py-1 rounded-full text-xs font-semibold uppercase tracking-wider flex items-center gap-1.5">
-            <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+          <span className={`${base} bg-amber-400/10 border-amber-400/30 text-amber-300`}>
+            <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
             Connecting...
           </span>
         );
       case "greeting":
         return (
-          <span className="bg-purple-100 text-purple-800 px-3 py-1 rounded-full text-xs font-semibold uppercase tracking-wider flex items-center gap-1.5">
-            <span className="w-2 h-2 rounded-full bg-purple-500 animate-pulse" />
+          <span className={`${base} bg-fuchsia-400/10 border-fuchsia-400/30 text-fuchsia-300`}>
+            <span className="w-2 h-2 rounded-full bg-fuchsia-400 animate-pulse" />
             AI Greeting
           </span>
         );
       case "listening":
         return (
-          <span className="bg-emerald-100 text-emerald-800 px-3 py-1 rounded-full text-xs font-semibold uppercase tracking-wider flex items-center gap-1.5">
-            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-ping" />
+          <span className={`${base} bg-emerald-400/10 border-emerald-400/30 text-emerald-300`}>
+            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
             {isRecording ? "Recording" : "Listening"}
           </span>
         );
       case "processing":
         return (
-          <span className="bg-blue-100 text-blue-800 px-3 py-1 rounded-full text-xs font-semibold uppercase tracking-wider flex items-center gap-1.5">
-            <span className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
-            Processing...
+          <span className={`${base} bg-cyan-400/10 border-cyan-400/30 text-cyan-300`}>
+            <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
+            {processingPhase === "transcribing" ? "Transcribing..." : "Thinking..."}
           </span>
         );
       case "speaking":
         return (
-          <span className="bg-purple-100 text-purple-800 px-3 py-1 rounded-full text-xs font-semibold uppercase tracking-wider flex items-center gap-1.5">
-            <span className="w-2 h-2 rounded-full bg-purple-500 animate-pulse" />
+          <span className={`${base} bg-indigo-400/10 border-indigo-400/30 text-indigo-300`}>
+            <span className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse" />
             Speaking
           </span>
         );
       case "generating_report":
-        return <span className="bg-slate-200 text-slate-600 px-3 py-1 rounded-full text-xs font-semibold uppercase tracking-wider">Analyzing Report</span>;
+        return <span className={`${base} bg-white/5 border-white/10 text-slate-400`}>Analyzing Report</span>;
       case "ended":
-        return <span className="bg-slate-200 text-slate-600 px-3 py-1 rounded-full text-xs font-semibold uppercase tracking-wider">Call Ended</span>;
+        return <span className={`${base} bg-white/5 border-white/10 text-slate-400`}>Call Ended</span>;
       case "error":
-        return <span className="bg-red-100 text-red-800 px-3 py-1 rounded-full text-xs font-semibold uppercase tracking-wider">Error</span>;
+        return <span className={`${base} bg-red-400/10 border-red-400/30 text-red-300`}>Error</span>;
       default:
         return null;
     }
@@ -494,14 +102,11 @@ export function CallScreen() {
   // Render report generating loader screen
   if (reportStatus === "generating") {
     return (
-      <div className="w-full max-w-lg bg-white rounded-2xl shadow-xl border border-slate-100 p-12 flex flex-col items-center justify-center min-h-[380px] animate-fadeIn">
+      <div className="w-full h-full glass rounded-3xl p-12 flex flex-col items-center justify-center min-h-[380px] animate-fadeIn shadow-2xl">
         <div className="flex flex-col items-center gap-6 text-center">
-          <svg className="animate-spin h-12 w-12 text-blue-600" fill="none" viewBox="0 0 24 24">
-            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-          </svg>
+          <Spinner size={48} className="text-cyan-400" />
           <div>
-            <h2 className="text-xl font-bold text-slate-800">Generating Health Report</h2>
+            <h2 className="text-xl font-bold text-white">Generating Health Report</h2>
             <p className="text-sm text-slate-400 mt-2 px-4 leading-relaxed">Analyzing intake dialogue variables. Please wait...</p>
           </div>
         </div>
@@ -512,31 +117,27 @@ export function CallScreen() {
   // Render report failed screen with retry action
   if (reportStatus === "failed") {
     return (
-      <div className="w-full max-w-lg bg-white rounded-2xl shadow-xl border border-slate-100 p-10 flex flex-col items-center justify-center min-h-[380px] animate-fadeIn">
+      <div className="w-full h-full glass rounded-3xl p-10 flex flex-col items-center justify-center min-h-[380px] animate-fadeIn shadow-2xl">
         <div className="flex flex-col items-center gap-5 text-center">
-          <div className="w-14 h-14 rounded-full bg-red-100 flex items-center justify-center text-red-600 text-3xl font-bold">
+          <div className="w-14 h-14 rounded-full bg-red-400/10 border border-red-400/30 flex items-center justify-center text-red-300 text-3xl font-bold">
             !
           </div>
           <div>
-            <h2 className="text-xl font-bold text-slate-800">Report Generation Failed</h2>
-            <p className="text-sm text-slate-500 mt-2.5 px-4 leading-relaxed">
+            <h2 className="text-xl font-bold text-white">Report Generation Failed</h2>
+            <p className="text-sm text-slate-400 mt-2.5 px-4 leading-relaxed">
               We couldn't generate the full screening report. The variables collected during your call could not be compiled.
             </p>
           </div>
           <div className="w-full flex gap-3 mt-6">
             <button
-              onClick={() => {
-                setReportStatus("generating");
-                setAppError(null);
-                safeSendMessage({ type: "retry_report" });
-              }}
-              className="flex-1 py-3 px-4 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-bold rounded-xl shadow-sm transition-all focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2"
+              onClick={retryReport}
+              className="flex-1 py-3 px-4 bg-gradient-to-r from-cyan-500 to-indigo-500 hover:opacity-90 active:opacity-80 text-white font-bold rounded-xl transition-all focus:outline-none focus:ring-2 focus:ring-cyan-400/60"
             >
               Try Again
             </button>
             <button
-              onClick={handleNewScreening}
-              className="flex-1 py-3 px-4 bg-slate-100 hover:bg-slate-200 active:bg-slate-300 text-slate-700 font-bold rounded-xl transition-all focus:outline-none"
+              onClick={newScreening}
+              className="flex-1 py-3 px-4 bg-white/5 hover:bg-white/10 text-slate-200 font-bold rounded-xl transition-all focus:outline-none focus:ring-2 focus:ring-white/20"
             >
               Close
             </button>
@@ -552,73 +153,61 @@ export function CallScreen() {
       <HealthReport
         report={generatedReport}
         transcript={chatLog}
-        onNewScreening={handleNewScreening}
+        onNewScreening={newScreening}
       />
     );
   }
 
   return (
-    <div className="w-full max-w-lg bg-white rounded-2xl shadow-lg border border-slate-100 p-8 flex flex-col">
+    <div className="w-full h-full min-h-0 glass rounded-3xl p-5 sm:p-6 flex flex-col shadow-2xl animate-fadeIn overflow-hidden">
       {/* Header */}
-      <div className="flex justify-between items-center border-b border-slate-100 pb-4 mb-6">
-        <div>
-          <h1 className="text-xl font-bold text-slate-800">AI Health Screening</h1>
-          <p className="text-xs text-slate-400">Voice Assistant with Intake Report</p>
-        </div>
-        <div className="flex flex-col items-end gap-1.5">
-          {getStatusBadge()}
+      <div className="shrink-0 flex justify-between items-center gap-3 mb-4">
+        {getStatusBadge()}
+        <div className="flex items-center gap-2">
           {callDuration > 0 && (
-            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
-              Duration: {formatDuration(callDuration)}
+            <span className="px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider font-mono text-slate-400 bg-white/5 border border-white/10">
+              {formatDuration(callDuration)}
             </span>
           )}
+          <span className="px-2.5 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider border border-white/10 bg-white/5 text-slate-300">
+            {language === "hi" ? "हिन्दी" : "English"}
+          </span>
         </div>
       </div>
 
-      {/* Connection Info */}
-      {sessionId && (
-        <div className="mb-4 bg-slate-50 border border-slate-100 rounded-lg p-3 text-xs text-slate-500 break-all">
-          <span className="font-semibold text-slate-700">Session ID:</span> {sessionId}
-        </div>
-      )}
-
       {/* App Errors Model Display Alert */}
       {appError && (
-        <div className="mb-4 bg-red-50 border border-red-200 text-red-700 text-sm rounded-xl p-4 flex flex-col gap-2 transition-all">
+        <div className="shrink-0 mb-4 bg-red-500/10 border border-red-500/20 text-red-200 text-sm rounded-xl p-4 flex flex-col gap-2 transition-all">
           <div className="flex justify-between items-center">
-            <span className="font-bold uppercase tracking-wider text-[10px] bg-red-100 px-2 py-0.5 rounded text-red-800">
+            <span className="font-bold uppercase tracking-wider text-[10px] bg-red-400/20 px-2 py-0.5 rounded text-red-300">
               {appError.code}
             </span>
             {appError.recoverable && (
-              <span className="text-[10px] text-red-500 font-semibold italic">Recoverable</span>
+              <span className="text-[10px] text-red-300/70 font-semibold italic">Recoverable</span>
             )}
           </div>
-          <p className="text-xs text-red-600 font-medium leading-relaxed">{appError.message}</p>
-          
+          <p className="text-xs text-red-200/90 font-medium leading-relaxed">{appError.message}</p>
+
           <div className="flex gap-2 mt-1">
             {appError.code === "WEBSOCKET_ERROR" && (
               <button
-                onClick={handleStartCall}
-                className="px-3 py-1 bg-red-600 hover:bg-red-700 active:bg-red-800 text-white rounded-lg font-bold text-xs shadow-sm transition-all focus:outline-none"
+                onClick={startCall}
+                className="px-3 py-1 bg-red-500 hover:bg-red-400 text-white rounded-lg font-bold text-xs transition-all focus:outline-none"
               >
                 Reconnect
               </button>
             )}
             {appError.code === "REPORT_ERROR" && (
               <button
-                onClick={() => {
-                  setReportStatus("generating");
-                  setAppError(null);
-                  safeSendMessage({ type: "retry_report" });
-                }}
-                className="px-3 py-1 bg-red-600 hover:bg-red-700 active:bg-red-800 text-white rounded-lg font-bold text-xs shadow-sm transition-all focus:outline-none"
+                onClick={retryReport}
+                className="px-3 py-1 bg-red-500 hover:bg-red-400 text-white rounded-lg font-bold text-xs transition-all focus:outline-none"
               >
                 Retry Report
               </button>
             )}
             <button
-              onClick={() => setAppError(null)}
-              className="px-3 py-1 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-lg font-bold text-xs transition-all focus:outline-none"
+              onClick={dismissError}
+              className="px-3 py-1 bg-white/10 hover:bg-white/15 text-slate-300 rounded-lg font-bold text-xs transition-all focus:outline-none"
             >
               Dismiss
             </button>
@@ -628,19 +217,36 @@ export function CallScreen() {
 
       {/* Safety Warning Urgent Card */}
       {status === "ended" && chatLog.some(log => log.sender === "assistant" && (log.text.includes("emergency") || log.text.includes("तुरंत"))) && (
-        <div className="mb-4 bg-red-50 border border-red-200 rounded-xl p-4 text-xs text-red-700 leading-relaxed font-semibold flex flex-col gap-1.5 animate-fadeIn">
-          <span className="uppercase tracking-wider text-[10px] bg-red-100 px-2 py-0.5 rounded text-red-800 self-start">Urgent Notice</span>
+        <div className="shrink-0 mb-4 bg-red-500/10 border border-red-500/25 rounded-xl p-4 text-xs text-red-200 leading-relaxed font-semibold flex flex-col gap-1.5 animate-fadeIn">
+          <span className="uppercase tracking-wider text-[10px] bg-red-400/20 px-2 py-0.5 rounded text-red-300 self-start">Urgent Notice</span>
           <span>Some symptoms described may require prompt medical attention. Please consider contacting an appropriate healthcare professional or emergency service.</span>
         </div>
       )}
 
       {/* Screen Messages Log */}
-      <div className="flex-1 min-h-[220px] max-h-[300px] overflow-y-auto border border-slate-100 rounded-xl p-4 bg-slate-50 mb-6 flex flex-col gap-3">
-        {chatLog.length === 0 && !interimText && status === "listening" && !isRecording ? (
-          <div className="flex-1 flex flex-col items-center justify-center text-sm text-slate-400 italic text-center gap-1">
-            <span className="text-base font-semibold text-slate-500 not-italic">Listening</span>
-            <span>Hold the microphone button and speak.</span>
-          </div>
+      <div className="flex-1 min-h-0 overflow-y-auto border border-white/10 rounded-xl p-4 bg-slate-950/60 mb-4 flex flex-col gap-3">
+        {chatLog.length === 0 && !interimText ? (
+          status === "idle" ? (
+            <div className="flex-1 flex flex-col items-center justify-center text-center gap-3 px-6">
+              <span className="w-12 h-12 rounded-full bg-white/5 border border-white/10 flex items-center justify-center">
+                <svg viewBox="0 0 24 24" className="w-5 h-5 text-slate-500" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                  <line x1="12" y1="19" x2="12" y2="23" />
+                  <line x1="8" y1="23" x2="16" y2="23" />
+                </svg>
+              </span>
+              <div>
+                <p className="text-sm font-semibold text-slate-400">Ready when you are</p>
+                <p className="text-xs text-slate-500 mt-0.5">Press Start Call to begin the screening.</p>
+              </div>
+            </div>
+          ) : status === "listening" && !isRecording ? (
+            <div className="flex-1 flex flex-col items-center justify-center text-sm text-slate-500 italic text-center gap-1">
+              <span className="text-base font-semibold text-slate-400 not-italic">Listening</span>
+              <span>Hold the mic and speak, or type your response below.</span>
+            </div>
+          ) : null
         ) : (
           <>
             {chatLog.map((turn, i) => (
@@ -650,14 +256,14 @@ export function CallScreen() {
                   turn.sender === "user" ? "self-end items-end" : "self-start items-start"
                 }`}
               >
-                <span className="text-[10px] text-slate-400 mb-0.5 uppercase tracking-wide px-1">
+                <span className="text-[10px] text-slate-500 mb-0.5 uppercase tracking-wide px-1">
                   {turn.sender === "user" ? "You" : "AI"}
                 </span>
                 <div
-                  className={`p-3 rounded-2xl text-sm leading-relaxed shadow-sm ${
+                  className={`p-3 rounded-2xl text-sm leading-relaxed ${
                     turn.sender === "user"
-                      ? "bg-blue-600 text-white rounded-tr-none"
-                      : "bg-white text-slate-800 border border-slate-100 rounded-tl-none"
+                      ? "bg-gradient-to-r from-cyan-500 to-indigo-500 text-white rounded-tr-none"
+                      : "bg-white/5 text-slate-200 border border-white/10 rounded-tl-none"
                   }`}
                 >
                   {turn.text}
@@ -668,10 +274,10 @@ export function CallScreen() {
             {/* Speaking / Interim Preview text bubble */}
             {isRecording && interimText && (
               <div className="flex flex-col max-w-[85%] self-end items-end">
-                <span className="text-[10px] text-slate-400 mb-0.5 uppercase tracking-wide px-1">
+                <span className="text-[10px] text-slate-500 mb-0.5 uppercase tracking-wide px-1">
                   You (Speaking...)
                 </span>
-                <div className="p-3 rounded-2xl text-sm leading-relaxed shadow-sm bg-blue-50 text-blue-800 rounded-tr-none italic border border-blue-100 animate-pulse">
+                <div className="p-3 rounded-2xl text-sm leading-relaxed bg-cyan-400/10 text-cyan-200 rounded-tr-none italic border border-cyan-400/20 animate-pulse">
                   "{interimText}"
                 </div>
               </div>
@@ -680,15 +286,15 @@ export function CallScreen() {
             {/* Processing state indicator bubble */}
             {status === "processing" && (
               <div className="flex flex-col max-w-[85%] self-end items-end">
-                <span className="text-[10px] text-slate-400 mb-0.5 uppercase tracking-wide px-1">
+                <span className="text-[10px] text-slate-500 mb-0.5 uppercase tracking-wide px-1">
                   You
                 </span>
-                <div className="p-3 rounded-2xl text-sm leading-relaxed shadow-sm bg-slate-50 text-slate-500 rounded-tr-none italic border border-slate-200 flex items-center gap-1.5">
-                  <svg className="animate-spin h-4 w-4 text-slate-400" fill="none" viewBox="0 0 24 24">
+                <div className="p-3 rounded-2xl text-sm leading-relaxed bg-white/5 text-slate-300 rounded-tr-none italic border border-white/10 flex items-center gap-1.5">
+                  <svg className="animate-spin h-4 w-4 text-cyan-400" fill="none" viewBox="0 0 24 24">
                     <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                     <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
                   </svg>
-                  Processing speech...
+                  {processingPhase === "transcribing" ? "Transcribing your speech..." : "Thinking about your response..."}
                 </div>
               </div>
             )}
@@ -697,115 +303,145 @@ export function CallScreen() {
         <div ref={chatEndRef} />
       </div>
 
-      {/* Language Selection & Privacy Notice Panel */}
+      {/* Language Selector */}
       {(status === "idle" || status === "ended") && (
-        <>
-          {/* Privacy Screening Disclaimer Notice */}
-          <div className="bg-slate-50 border border-slate-100 rounded-xl p-4 text-[11px] text-slate-500 leading-relaxed mb-4 font-medium">
-            <strong>Screening Demo Privacy Notice:</strong> This application streams voice audio to Deepgram for STT, OpenAI for conversational decisions, and ElevenLabs for TTS to generate structured intake reports. It does not provide medical diagnoses. Please avoid sharing real highly sensitive personal identifiers.
+        <div className="shrink-0 flex items-center justify-center gap-3 mb-4">
+          <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider" id="lang-select-label">
+            Language
+          </span>
+          <div className="flex rounded-xl border border-white/10 bg-white/5 p-1" role="radiogroup" aria-labelledby="lang-select-label">
+            <button
+              onClick={() => setLanguage("en")}
+              aria-checked={language === "en"}
+              role="radio"
+              className={`px-5 py-1.5 rounded-lg text-xs font-bold transition-all focus:outline-none focus:ring-2 focus:ring-cyan-400/60 ${
+                language === "en"
+                  ? "bg-gradient-to-r from-cyan-500 to-indigo-500 text-white"
+                  : "text-slate-400 hover:text-white"
+              }`}
+            >
+              English
+            </button>
+            <button
+              onClick={() => setLanguage("hi")}
+              aria-checked={language === "hi"}
+              role="radio"
+              className={`px-5 py-1.5 rounded-lg text-xs font-bold transition-all focus:outline-none focus:ring-2 focus:ring-cyan-400/60 ${
+                language === "hi"
+                  ? "bg-gradient-to-r from-cyan-500 to-indigo-500 text-white"
+                  : "text-slate-400 hover:text-white"
+              }`}
+            >
+              हिन्दी (Hindi)
+            </button>
           </div>
-
-          {/* Accessible Language Selector */}
-          <div className="flex items-center justify-between bg-slate-50 rounded-xl p-4 mb-6">
-            <span className="text-sm font-semibold text-slate-600" id="lang-select-label">Choose Language:</span>
-            <div className="flex gap-2" role="radiogroup" aria-labelledby="lang-select-label">
-              <button
-                onClick={() => setLanguage("en")}
-                aria-checked={language === "en"}
-                role="radio"
-                className={`px-4 py-2 rounded-lg text-xs font-bold transition-all focus:outline-none focus:ring-2 focus:ring-blue-400 ${
-                  language === "en"
-                    ? "bg-blue-600 text-white shadow-sm"
-                    : "bg-white text-slate-600 border border-slate-200 hover:bg-slate-100/50"
-                }`}
-              >
-                English
-              </button>
-              <button
-                onClick={() => setLanguage("hi")}
-                aria-checked={language === "hi"}
-                role="radio"
-                className={`px-4 py-2 rounded-lg text-xs font-bold transition-all focus:outline-none focus:ring-2 focus:ring-blue-400 ${
-                  language === "hi"
-                    ? "bg-blue-600 text-white shadow-sm"
-                    : "bg-white text-slate-600 border border-slate-200 hover:bg-slate-100/50"
-                }`}
-              >
-                हिन्दी (Hindi)
-              </button>
-            </div>
-          </div>
-        </>
+        </div>
       )}
 
       {/* Microphone / PTT Interaction Panel */}
       {!(status === "idle" || status === "ended" || status === "error") && (
-        <div className="mb-6 flex flex-col items-center">
-          <MicrophoneButton
-            status={status}
-            isRecording={isRecording}
-            onStartRecording={handleStartRecording}
-            onStopRecording={handleStopRecording}
-          />
-          
-          {/* Speaking indicator and waveform */}
-          {(status === "speaking" || status === "greeting") && (
-            <div className="mt-3 text-xs text-slate-500 font-semibold text-center italic">
-              🔊 AI is speaking...<br />
-              <span className="font-normal text-slate-400 text-[10px]">Press & hold microphone button to barge-in/interrupt.</span>
-            </div>
-          )}
+        <div className="shrink-0 mb-5 flex flex-col gap-2.5">
+          {/* Typed response + Send + mic inline */}
+          <div className="w-full flex items-center gap-2">
+            <input
+              type="text"
+              value={draftText}
+              onChange={(e) => setDraftText(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  sendText();
+                }
+              }}
+              placeholder={language === "hi" ? "अपना उत्तर यहाँ टाइप करें…" : "Type your response…"}
+              disabled={isRecording || status === "processing" || status === "connecting" || status === "generating_report"}
+              className="flex-1 px-4 py-2.5 rounded-xl border border-white/10 bg-slate-950/60 text-sm text-slate-200 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-cyan-400/50 disabled:opacity-50 disabled:cursor-not-allowed"
+            />
+            <button
+              onClick={sendText}
+              disabled={!draftText.trim() || isRecording || status === "processing" || status === "connecting" || status === "generating_report"}
+              className="px-4 py-2.5 bg-gradient-to-r from-cyan-500 to-indigo-500 hover:opacity-90 active:opacity-80 text-white font-bold rounded-xl text-sm transition-all focus:outline-none focus:ring-2 focus:ring-cyan-400/60 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              Send
+            </button>
+            <MicrophoneButton
+              status={status}
+              isRecording={isRecording}
+              onStartRecording={startRecordingTurn}
+              onStopRecording={stopRecordingTurn}
+            />
+          </div>
 
-          {/* Listening waveform indicator */}
-          {isRecording && (
-            <div className="mt-3 flex flex-col items-center gap-1.5">
-              <div className="flex gap-1 justify-center items-center h-4 my-1">
-                <span className="w-1 h-1.5 bg-red-500 rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
-                <span className="w-1 h-3.5 bg-red-500 rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
-                <span className="w-1 h-5 bg-red-500 rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
-                <span className="w-1 h-3.5 bg-red-500 rounded-full animate-bounce" style={{ animationDelay: "450ms" }} />
-                <span className="w-1 h-1.5 bg-red-500 rounded-full animate-bounce" style={{ animationDelay: "600ms" }} />
+          {/* Status indicators strip */}
+          <div className="min-h-[18px] flex flex-col items-center justify-center gap-1">
+            {isSpeaking && (
+              <div className="text-xs text-slate-400 font-semibold text-center">
+                <span className="inline-flex items-center gap-1.5">
+                  <svg viewBox="0 0 24 24" className="w-3.5 h-3.5 text-indigo-400" fill="currentColor" aria-hidden="true">
+                    <path d="M3 10v4h4l5 5V5L7 10H3z" />
+                    <path d="M16.5 12a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4z" opacity="0.6" />
+                  </svg>
+                  AI is speaking... <span className="italic text-slate-500">hold the mic to barge-in</span>
+                </span>
               </div>
-              <span className="text-[10px] text-red-500 font-bold uppercase tracking-wider">🔴 Listening to you...</span>
-            </div>
-          )}
-          
-          {status === "processing" && (
-            <div className="mt-3 text-[10px] text-slate-500 font-bold uppercase tracking-wider flex items-center gap-1.5">
-              <span className="w-2 h-2 rounded-full bg-slate-500 animate-pulse" />
-              Processing your response...
-            </div>
-          )}
+            )}
 
-          {status === "listening" && !isRecording && (
-            <div className="mt-3 text-[10px] text-emerald-600 font-bold uppercase tracking-wider flex items-center gap-1.5">
-              <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
-              🎙 Listening...
-            </div>
-          )}
+            {isRecording && (
+              <div className="flex flex-col items-center gap-1">
+                <div className="flex gap-1 justify-center items-center h-4">
+                  <span className="w-1 h-1.5 bg-red-400 rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
+                  <span className="w-1 h-3.5 bg-red-400 rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
+                  <span className="w-1 h-5 bg-red-400 rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
+                  <span className="w-1 h-3.5 bg-red-400 rounded-full animate-bounce" style={{ animationDelay: "450ms" }} />
+                  <span className="w-1 h-1.5 bg-red-400 rounded-full animate-bounce" style={{ animationDelay: "600ms" }} />
+                </div>
+                <span className="text-[10px] text-red-300 font-bold uppercase tracking-wider">Listening to you — release to send</span>
+              </div>
+            )}
+
+            {!isRecording && !isSpeaking && status === "processing" && (
+              <div className="text-[10px] text-slate-400 font-bold uppercase tracking-wider flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
+                {processingPhase === "transcribing" ? "Transcribing..." : "Thinking..."}
+              </div>
+            )}
+
+            {!isRecording && status === "listening" && (
+              <div className="text-[10px] text-emerald-300 font-bold uppercase tracking-wider flex items-center gap-1.5">
+                <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse" />
+                Listening — hold the mic to talk, or type below
+              </div>
+            )}
+          </div>
         </div>
       )}
 
       {/* Call Actions */}
-      <div className="flex flex-col gap-3">
+      <div className="shrink-0 flex flex-col gap-3">
         {status === "idle" || status === "ended" || status === "error" ? (
           <button
-            onClick={handleStartCall}
+            onClick={startCall}
             aria-label={status === "ended" ? "Start New Screening Session" : "Start Screening Session"}
-            className="w-full py-3.5 px-6 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-bold rounded-xl transition-all shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 tracking-wide uppercase text-xs"
+            className="glow w-full py-3.5 px-6 bg-gradient-to-r from-cyan-500 to-indigo-500 hover:opacity-90 active:opacity-80 text-white font-bold rounded-xl transition-all focus:outline-none focus:ring-2 focus:ring-cyan-400/60 tracking-wide uppercase text-xs"
           >
             {status === "ended" ? "Start New Screening" : "Start Call"}
           </button>
         ) : (
           <button
-            onClick={handleEndCall}
+            onClick={endCall}
             aria-label="End Current Screening Session"
-            className="w-full py-3.5 px-6 bg-red-600 hover:bg-red-700 active:bg-red-800 text-white font-bold rounded-xl transition-all shadow-sm focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-2 tracking-wide uppercase text-xs"
+            className="w-full py-3.5 px-6 bg-red-500 hover:bg-red-400 active:bg-red-500 text-white font-bold rounded-xl transition-all focus:outline-none focus:ring-2 focus:ring-red-400/60 tracking-wide uppercase text-xs"
           >
             End Call
           </button>
         )}
       </div>
+
+      {/* Session ID */}
+      {sessionId && (
+        <p className="shrink-0 mt-4 text-[10px] font-mono text-slate-600 text-center truncate" title={sessionId}>
+          Session · {sessionId}
+        </p>
+      )}
     </div>
   );
 }
